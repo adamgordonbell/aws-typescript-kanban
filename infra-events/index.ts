@@ -419,42 +419,25 @@ new aws.lambda.Permission("webhook-api-permission", {
   sourceArn: pulumi.interpolate`${publicApi.executionArn}/*/*`,
 });
 
-// ─── 9. Static site (S3 bucket + website + uploaded frontend) ────
+// ─── 9. Static site (S3 + CloudFront CDN) ────────────────────────
+// The S3 bucket stays private. A CloudFront distribution serves the
+// frontend via Origin Access Control (OAC) and proxies /api/* and
+// /webhooks/* to the API Gateway, making everything same-origin.
 
 const frontendBucket = new aws.s3.Bucket("frontend-bucket", {
   forceDestroy: true,
 });
 
-const frontendWebsite = new aws.s3.BucketWebsiteConfiguration("frontend-website", {
+// Block all public access — CloudFront is the only reader.
+new aws.s3.BucketPublicAccessBlock("frontend-public-access", {
   bucket: frontendBucket.id,
-  indexDocument: {
-    suffix: "index.html",
-  },
+  blockPublicAcls: true,
+  blockPublicPolicy: true,
+  ignorePublicAcls: true,
+  restrictPublicBuckets: true,
 });
 
-const frontendPublicAccess = new aws.s3.BucketPublicAccessBlock("frontend-public-access", {
-  bucket: frontendBucket.id,
-  blockPublicAcls: false,
-  blockPublicPolicy: false,
-  ignorePublicAcls: false,
-  restrictPublicBuckets: false,
-});
-
-new aws.s3.BucketPolicy("frontend-policy", {
-  bucket: frontendBucket.id,
-  policy: frontendBucket.arn.apply((arn) => JSON.stringify({
-    Version: "2012-10-17",
-    Statement: [
-      {
-        Effect: "Allow",
-        Principal: "*",
-        Action: ["s3:GetObject"],
-        Resource: [`${arn}/*`],
-      },
-    ],
-  })),
-}, { dependsOn: [frontendPublicAccess] });
-
+// Upload static assets to S3.
 const frontendDir = requireFile("dist/frontend");
 for (const fileName of fs.readdirSync(frontendDir)) {
   if (fileName === "config.js") {
@@ -474,12 +457,139 @@ for (const fileName of fs.readdirSync(frontendDir)) {
   });
 }
 
+// config.js uses an empty apiBaseUrl because the API is served from
+// the same CloudFront domain (same-origin), so relative paths work.
 new aws.s3.BucketObject("frontend-config", {
   bucket: frontendBucket.id,
   key: "config.js",
   contentType: "application/javascript; charset=utf-8",
-  content: publicApi.apiEndpoint.apply((apiBaseUrl) =>
-    `window.__WORKSHOP_CONFIG__ = ${JSON.stringify({ apiBaseUrl })};`,
+  content: `window.__WORKSHOP_CONFIG__ = ${JSON.stringify({ apiBaseUrl: "" })};`,
+});
+
+// Origin Access Control lets CloudFront sign requests to S3.
+const oac = new aws.cloudfront.OriginAccessControl("frontend-oac", {
+  originAccessControlOriginType: "s3",
+  signingBehavior: "always",
+  signingProtocol: "sigv4",
+});
+
+const s3OriginId = "s3-frontend";
+const apiOriginId = "api-gateway";
+
+// Extract the API Gateway domain and stage path from its endpoint URL
+// so we can set them as the CloudFront origin domain and origin path.
+const apiDomain = publicApi.apiEndpoint.apply((url) => {
+  const parsed = new URL(url);
+  return parsed.hostname;
+});
+
+const cdn = new aws.cloudfront.Distribution("frontend-cdn", {
+  comment: `${appName} CDN`,
+  enabled: true,
+  defaultRootObject: "index.html",
+  isIpv6Enabled: true,
+  httpVersion: "http2and3",
+  priceClass: "PriceClass_100",
+  waitForDeployment: false,
+
+  origins: [
+    // S3 origin for static assets.
+    {
+      originId: s3OriginId,
+      domainName: frontendBucket.bucketRegionalDomainName,
+      originAccessControlId: oac.id,
+    },
+    // API Gateway origin for /api/* and /webhooks/*.
+    {
+      originId: apiOriginId,
+      domainName: apiDomain,
+      customOriginConfig: {
+        httpPort: 80,
+        httpsPort: 443,
+        originProtocolPolicy: "https-only",
+        originSslProtocols: ["TLSv1.2"],
+      },
+    },
+  ],
+
+  // Default behavior: serve static files from S3.
+  defaultCacheBehavior: {
+    targetOriginId: s3OriginId,
+    viewerProtocolPolicy: "redirect-to-https",
+    allowedMethods: ["GET", "HEAD", "OPTIONS"],
+    cachedMethods: ["GET", "HEAD"],
+    compress: true,
+    forwardedValues: {
+      queryString: false,
+      cookies: { forward: "none" },
+    },
+  },
+
+  // /api/* → API Gateway (no caching, forward everything).
+  orderedCacheBehaviors: [
+    {
+      pathPattern: "/api/*",
+      targetOriginId: apiOriginId,
+      viewerProtocolPolicy: "redirect-to-https",
+      allowedMethods: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+      cachedMethods: ["GET", "HEAD"],
+      compress: true,
+      forwardedValues: {
+        queryString: true,
+        headers: ["Authorization", "Origin", "Accept", "Content-Type"],
+        cookies: { forward: "all" },
+      },
+      minTtl: 0,
+      defaultTtl: 0,
+      maxTtl: 0,
+    },
+    // /webhooks/* → API Gateway (no caching).
+    {
+      pathPattern: "/webhooks/*",
+      targetOriginId: apiOriginId,
+      viewerProtocolPolicy: "redirect-to-https",
+      allowedMethods: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+      cachedMethods: ["GET", "HEAD"],
+      compress: true,
+      forwardedValues: {
+        queryString: true,
+        headers: ["Authorization", "Origin", "Accept", "Content-Type"],
+        cookies: { forward: "all" },
+      },
+      minTtl: 0,
+      defaultTtl: 0,
+      maxTtl: 0,
+    },
+  ],
+
+  restrictions: {
+    geoRestriction: { restrictionType: "none" },
+  },
+
+  viewerCertificate: {
+    cloudfrontDefaultCertificate: true,
+  },
+});
+
+// Grant CloudFront read access to the S3 bucket.
+new aws.s3.BucketPolicy("frontend-policy", {
+  bucket: frontendBucket.id,
+  policy: pulumi.all([frontendBucket.arn, cdn.arn]).apply(([bucketArn, distArn]) =>
+    JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Sid: "AllowCloudFrontOAC",
+          Effect: "Allow",
+          Principal: { Service: "cloudfront.amazonaws.com" },
+          Action: "s3:GetObject",
+          Resource: `${bucketArn}/*`,
+          Condition: {
+            StringEquals: { "AWS:SourceArn": distArn },
+          },
+        },
+      ],
+    }),
   ),
 });
 
@@ -492,4 +602,4 @@ export const tableName = boardTable.name;
 export const queueUrl = eventQueue.id;
 export const deadLetterQueueUrl = deadLetterQueue.id;
 export const publicApiUrl = publicApi.apiEndpoint;
-export const frontendUrl = pulumi.interpolate`http://${frontendWebsite.websiteEndpoint}`;
+export const frontendUrl = pulumi.interpolate`https://${cdn.domainName}`;
