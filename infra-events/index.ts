@@ -83,65 +83,140 @@ const eventQueue = new aws.sqs.Queue("event-queue", {
   })),
 });
 
-// ─── 2. Lambda runtime (IAM role + code bundle + factory) ─────────
-// Both Lambdas share the same code bundle, the same IAM role, and
-// the same "how to build a Lambda" recipe.
+// ─── 2. IAM roles (least-privilege, one per Lambda) ───────────────
+// Each Lambda gets its own role scoped to exactly the AWS services
+// it needs. This replaces the former shared "lambda-role".
 
-const lambdaRole = new aws.iam.Role("lambda-role", {
+// --- Backend HTTP role: CloudWatch Logs + DynamoDB + SQS send ---
+const backendHttpRole = new aws.iam.Role("backend-http-role", {
   assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
     Service: "lambda.amazonaws.com",
   }),
 });
 
-new aws.iam.RolePolicyAttachment("lambda-basic-execution", {
-  role: lambdaRole.name,
+new aws.iam.RolePolicyAttachment("backend-http-basic-execution", {
+  role: backendHttpRole.name,
   policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole,
 });
 
-new aws.iam.RolePolicyAttachment("lambda-vpc-execution", {
-  role: lambdaRole.name,
-  policyArn: aws.iam.ManagedPolicy.AWSLambdaVPCAccessExecutionRole,
-});
-
-new aws.iam.RolePolicy("app-policy", {
-  role: lambdaRole.id,
+new aws.iam.RolePolicy("backend-http-dynamo-policy", {
+  role: backendHttpRole.id,
   policy: boardTable.arn.apply((tableArn) => JSON.stringify({
     Version: "2012-10-17",
     Statement: [
       {
         Effect: "Allow",
-        Action: [
-          "dynamodb:GetItem",
-          "dynamodb:PutItem",
-        ],
+        Action: ["dynamodb:GetItem", "dynamodb:PutItem"],
         Resource: tableArn,
       },
     ],
   })),
 });
 
-// New in Stage 3: grant the shared Lambda role access to the SQS
-// queue and DLQ. Kept as a separate RolePolicy so it's visible as
-// a pure addition to the Stage 2 IAM setup.
-new aws.iam.RolePolicy("sqs-policy", {
-  role: lambdaRole.id,
+new aws.iam.RolePolicy("backend-http-sqs-policy", {
+  role: backendHttpRole.id,
   policy: pulumi.all([eventQueue.arn, deadLetterQueue.arn]).apply(([queueArn, dlqArn]) => JSON.stringify({
     Version: "2012-10-17",
     Statement: [
       {
         Effect: "Allow",
         Action: [
+          "sqs:SendMessage",
           "sqs:GetQueueAttributes",
           "sqs:PurgeQueue",
-          "sqs:SendMessage",
-          "sqs:ReceiveMessage",
-          "sqs:DeleteMessage",
-          "sqs:ChangeMessageVisibility",
         ],
         Resource: [queueArn, dlqArn],
       },
     ],
   })),
+});
+
+// --- Backend Worker role: CloudWatch Logs + DynamoDB + SQS consume ---
+const backendWorkerRole = new aws.iam.Role("backend-worker-role", {
+  assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+    Service: "lambda.amazonaws.com",
+  }),
+});
+
+new aws.iam.RolePolicyAttachment("backend-worker-basic-execution", {
+  role: backendWorkerRole.name,
+  policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole,
+});
+
+new aws.iam.RolePolicy("backend-worker-dynamo-policy", {
+  role: backendWorkerRole.id,
+  policy: boardTable.arn.apply((tableArn) => JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Effect: "Allow",
+        Action: ["dynamodb:GetItem", "dynamodb:PutItem"],
+        Resource: tableArn,
+      },
+    ],
+  })),
+});
+
+new aws.iam.RolePolicy("backend-worker-sqs-policy", {
+  role: backendWorkerRole.id,
+  policy: pulumi.all([eventQueue.arn, deadLetterQueue.arn]).apply(([queueArn, dlqArn]) => JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Effect: "Allow",
+        Action: [
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:ChangeMessageVisibility",
+          "sqs:GetQueueAttributes",
+        ],
+        Resource: [queueArn, dlqArn],
+      },
+    ],
+  })),
+});
+
+// --- Webhook role: CloudWatch Logs + SQS send (event queue only) ---
+const webhookRole = new aws.iam.Role("webhook-role", {
+  assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+    Service: "lambda.amazonaws.com",
+  }),
+});
+
+new aws.iam.RolePolicyAttachment("webhook-basic-execution", {
+  role: webhookRole.name,
+  policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole,
+});
+
+new aws.iam.RolePolicy("webhook-sqs-policy", {
+  role: webhookRole.id,
+  policy: eventQueue.arn.apply((queueArn) => JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Effect: "Allow",
+        Action: ["sqs:SendMessage"],
+        Resource: queueArn,
+      },
+    ],
+  })),
+});
+
+// --- BFF role: CloudWatch Logs + VPC access (no DynamoDB/SQS) ---
+const bffRole = new aws.iam.Role("bff-role", {
+  assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+    Service: "lambda.amazonaws.com",
+  }),
+});
+
+new aws.iam.RolePolicyAttachment("bff-basic-execution", {
+  role: bffRole.name,
+  policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole,
+});
+
+new aws.iam.RolePolicyAttachment("bff-vpc-execution", {
+  role: bffRole.name,
+  policyArn: aws.iam.ManagedPolicy.AWSLambdaVPCAccessExecutionRole,
 });
 
 // One asset archive, shared by both Lambdas. The archive has the
@@ -158,6 +233,7 @@ const lambdaCode = new pulumi.asset.AssetArchive({
 function createLambda(
   name: string,
   handler: string,
+  role: aws.iam.Role,
   environment: Record<string, pulumi.Input<string>>,
   overrides: {
     publish?: boolean;
@@ -165,7 +241,7 @@ function createLambda(
   } = {},
 ): aws.lambda.Function {
   return new aws.lambda.Function(name, {
-    role: lambdaRole.arn,
+    role: role.arn,
     runtime: "nodejs20.x",
     code: lambdaCode,
     handler,
@@ -194,6 +270,7 @@ function createLambda(
 const backendFunction = createLambda(
   "backend-http",
   "dist/services/backend/src/lambda-http.handler",
+  backendHttpRole,
   {},
   { publish: backendProvisionedConcurrency !== undefined && backendProvisionedConcurrency > 0 },
 );
@@ -216,7 +293,7 @@ if (backendProvisionedConcurrency !== undefined && backendProvisionedConcurrency
 // Consumes messages from the event queue and writes to DynamoDB.
 // EventSourceMapping tells Lambda to poll SQS for this function.
 
-const workerFunction = createLambda("backend-worker", "dist/services/backend/src/lambda-worker.handler", {});
+const workerFunction = createLambda("backend-worker", "dist/services/backend/src/lambda-worker.handler", backendWorkerRole, {});
 
 new aws.lambda.EventSourceMapping("worker-event-source", {
   eventSourceArn: eventQueue.arn,
@@ -229,7 +306,7 @@ new aws.lambda.EventSourceMapping("worker-event-source", {
 // Public HTTP entrypoint for external webhook posts. Writes the
 // payload to the SQS queue and returns 202 immediately.
 
-const webhookFunction = createLambda("webhook", "dist/services/webhook/src/lambda.handler", {});
+const webhookFunction = createLambda("webhook", "dist/services/webhook/src/lambda.handler", webhookRole, {});
 
 // ─── 4. VPC (new in Stage 2) ──────────────────────────────────────
 // A small VPC with two private subnets across two AZs. No IGW, no
@@ -338,7 +415,7 @@ const backendBaseUrl = pulumi.interpolate`http://${backendLoadBalancer.dnsName}`
 // Same BFF as Stage 1, but now it runs inside the VPC so it can
 // reach the internal ALB over private DNS.
 
-const bffFunction = createLambda("bff", "dist/services/bff/src/lambda.handler", {
+const bffFunction = createLambda("bff", "dist/services/bff/src/lambda.handler", bffRole, {
   BACKEND_BASE_URL: backendBaseUrl,
   BFF_RETRY_COUNT: "1",
 }, {
