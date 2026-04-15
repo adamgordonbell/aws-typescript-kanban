@@ -16,9 +16,12 @@
     "@aws-sdk/client-sqs": "^3.1027.0",
     "@aws-sdk/lib-dynamodb": "^3.1027.0",
     "@pulumi/aws": "^7.24.0",
+    "@pulumi/awsx": "^3.5.0",
+    "@pulumi/docker-build": "^0.0.15",
     "@pulumi/pulumi": "^3.230.0"
   },
   "devDependencies": {
-    "@types/aws-lambda": "^8.10.161"
+    "@types/aws-lambda": "^8.10.161",
+    "typescript": "^6.0.2"
   }
 }
