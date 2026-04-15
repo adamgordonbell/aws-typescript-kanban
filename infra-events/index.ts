@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import * as aws from "@pulumi/aws";
+import * as awsx from "@pulumi/awsx";
 import * as pulumi from "@pulumi/pulumi";
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -83,9 +84,39 @@ const eventQueue = new aws.sqs.Queue("event-queue", {
   })),
 });
 
-// ─── 2. Lambda runtime (IAM role + code bundle + factory) ─────────
-// Both Lambdas share the same code bundle, the same IAM role, and
-// the same "how to build a Lambda" recipe.
+// ─── 1b. Container images (ECR + Docker build) ────────────────────
+// Each Lambda gets its own ECR repository and Docker image built
+// from the existing Dockerfiles under services/. The build context
+// is the project root so the Dockerfiles can COPY from dist/.
+
+const backendRepo = new awsx.ecr.Repository("backend-repo", { forceDelete: true });
+const bffRepo = new awsx.ecr.Repository("bff-repo", { forceDelete: true });
+const webhookRepo = new awsx.ecr.Repository("webhook-repo", { forceDelete: true });
+
+const backendImage = new awsx.ecr.Image("backend-image", {
+  repositoryUrl: backendRepo.url,
+  context: projectRoot,
+  dockerfile: path.join(projectRoot, "services/backend/Dockerfile"),
+  platform: "linux/amd64",
+});
+
+const bffImage = new awsx.ecr.Image("bff-image", {
+  repositoryUrl: bffRepo.url,
+  context: projectRoot,
+  dockerfile: path.join(projectRoot, "services/bff/Dockerfile"),
+  platform: "linux/amd64",
+});
+
+const webhookImage = new awsx.ecr.Image("webhook-image", {
+  repositoryUrl: webhookRepo.url,
+  context: projectRoot,
+  dockerfile: path.join(projectRoot, "services/webhook/Dockerfile"),
+  platform: "linux/amd64",
+});
+
+// ─── 2. Lambda runtime (IAM role + factory) ───────────────────────
+// Both Lambdas share the same IAM role and the same "how to build
+// a Lambda" recipe. Images are pulled from ECR at deploy time.
 
 const lambdaRole = new aws.iam.Role("lambda-role", {
   assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
@@ -144,31 +175,24 @@ new aws.iam.RolePolicy("sqs-policy", {
   })),
 });
 
-// One asset archive, shared by both Lambdas. The archive has the
-// compiled `dist/`, the seed `data/`, and `node_modules/` so the
-// handlers run without any additional deploy step.
-const lambdaCode = new pulumi.asset.AssetArchive({
-  dist: new pulumi.asset.FileArchive(requireFile("dist")),
-  data: new pulumi.asset.FileArchive(requireFile("data")),
-  node_modules: new pulumi.asset.FileArchive(requireFile("node_modules")),
-  "package.json": new pulumi.asset.FileAsset(requireFile("package.json")),
-});
-
 // `createLambda` is just a TypeScript function that returns a resource.
+// Each Lambda is deployed as a container image pulled from ECR.
 function createLambda(
   name: string,
-  handler: string,
+  imageUri: pulumi.Input<string>,
   environment: Record<string, pulumi.Input<string>>,
   overrides: {
     publish?: boolean;
     vpcConfig?: pulumi.Input<aws.types.input.lambda.FunctionVpcConfig>;
+    /** Override the container CMD (e.g. to reuse an image with a different handler). */
+    command?: pulumi.Input<string>[];
   } = {},
 ): aws.lambda.Function {
   return new aws.lambda.Function(name, {
     role: lambdaRole.arn,
-    runtime: "nodejs20.x",
-    code: lambdaCode,
-    handler,
+    packageType: "Image",
+    imageUri,
+    imageConfig: overrides.command ? { commands: overrides.command } : undefined,
     timeout: lambdaTimeout,
     memorySize: lambdaMemory,
     publish: overrides.publish,
@@ -193,7 +217,7 @@ function createLambda(
 
 const backendFunction = createLambda(
   "backend-http",
-  "dist/services/backend/src/lambda-http.handler",
+  backendImage.imageUri,
   {},
   { publish: backendProvisionedConcurrency !== undefined && backendProvisionedConcurrency > 0 },
 );
@@ -216,7 +240,12 @@ if (backendProvisionedConcurrency !== undefined && backendProvisionedConcurrency
 // Consumes messages from the event queue and writes to DynamoDB.
 // EventSourceMapping tells Lambda to poll SQS for this function.
 
-const workerFunction = createLambda("backend-worker", "dist/services/backend/src/lambda-worker.handler", {});
+const workerFunction = createLambda(
+  "backend-worker",
+  backendImage.imageUri,
+  {},
+  { command: ["services/backend/src/lambda-worker.handler"] },
+);
 
 new aws.lambda.EventSourceMapping("worker-event-source", {
   eventSourceArn: eventQueue.arn,
@@ -229,7 +258,7 @@ new aws.lambda.EventSourceMapping("worker-event-source", {
 // Public HTTP entrypoint for external webhook posts. Writes the
 // payload to the SQS queue and returns 202 immediately.
 
-const webhookFunction = createLambda("webhook", "dist/services/webhook/src/lambda.handler", {});
+const webhookFunction = createLambda("webhook", webhookImage.imageUri, {});
 
 // ─── 4. VPC (new in Stage 2) ──────────────────────────────────────
 // A small VPC with two private subnets across two AZs. No IGW, no
@@ -338,7 +367,7 @@ const backendBaseUrl = pulumi.interpolate`http://${backendLoadBalancer.dnsName}`
 // Same BFF as Stage 1, but now it runs inside the VPC so it can
 // reach the internal ALB over private DNS.
 
-const bffFunction = createLambda("bff", "dist/services/bff/src/lambda.handler", {
+const bffFunction = createLambda("bff", bffImage.imageUri, {
   BACKEND_BASE_URL: backendBaseUrl,
   BFF_RETRY_COUNT: "1",
 }, {
