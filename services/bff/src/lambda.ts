@@ -75,6 +75,12 @@ export async function handler(event: APIGatewayProxyEventV2): Promise<APIGateway
   const method = event.requestContext.http.method;
   const path = event.rawPath;
 
+  const expectedToken = process.env.API_TOKEN;
+  const providedToken = event.headers?.["x-api-key"] ?? event.headers?.["X-Api-Key"];
+  if (!expectedToken || providedToken !== expectedToken) {
+    return json(401, { error: "Unauthorized" });
+  }
+
   if (method === "GET" && path === "/api/logs") {
     return json(200, { entries: activityLog.list(50) });
   }

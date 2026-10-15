@@ -51,6 +51,7 @@ declare global {
     __WORKSHOP_CONFIG__?: {
       apiBaseUrl?: string;
       backendUrl?: string;
+      apiToken?: string;
     };
   }
 }
@@ -332,10 +333,20 @@ function apiUrl(path: string): string {
   return `${apiBaseUrl}${path}`;
 }
 
+const apiToken = window.__WORKSHOP_CONFIG__?.apiToken ?? "";
+
+function apiFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (apiToken) {
+    headers.set("x-api-key", apiToken);
+  }
+  return fetch(input, { ...init, headers });
+}
+
 async function loadBoard(message = "Board refreshed."): Promise<void> {
   const [boardResponse, notificationsResponse] = await Promise.all([
-    fetch(apiUrl("/api/board")),
-    fetch(apiUrl("/api/notifications")),
+    apiFetch(apiUrl("/api/board")),
+    apiFetch(apiUrl("/api/notifications")),
   ]);
   if (!boardResponse.ok) {
     throw new Error(`Failed to fetch board (${boardResponse.status})`);
@@ -359,7 +370,7 @@ async function moveItem(itemId: string, nextStatus: Status): Promise<void> {
   }
 
   try {
-    const response = await fetch(apiUrl(`/api/items/${itemId}/status`), {
+    const response = await apiFetch(apiUrl(`/api/items/${itemId}/status`), {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -472,7 +483,7 @@ function handleOpenEventPanel(): void {
 }
 
 async function loadSelectedItemDetails(itemId: string): Promise<void> {
-  const response = await fetch(apiUrl(`/api/items/${itemId}`));
+  const response = await apiFetch(apiUrl(`/api/items/${itemId}`));
 
   if (!response.ok) {
     state.selectedHistory = [];
@@ -519,7 +530,7 @@ async function handleEventSubmit(event: Event): Promise<void> {
 }
 
 async function handleReset(): Promise<void> {
-  const response = await fetch(apiUrl("/api/board/reset"), { method: "POST" });
+  const response = await apiFetch(apiUrl("/api/board/reset"), { method: "POST" });
   if (!response.ok) {
     state.statusMessage = `Reset failed (${response.status})`;
     render();
